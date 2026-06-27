@@ -1,7 +1,7 @@
 """
 nodriver sidecar — FastAPI service for CDP-native undetected browser fetching.
 
-VERSION: 1.1.0  (switch to zendriver — fixes ProxyForwarder NameError)
+VERSION: 1.2.0  (per-request proxy isolation via raw CDP + local CONNECT forwarder)
 
 WHY NODRIVER OVER PATCHRIGHT
 -----------------------------
@@ -21,45 +21,29 @@ LIBRARY: ZENDRIVER (nodriver fork)
 ------------------------------------
 This sidecar uses zendriver, not the upstream nodriver package.
 
-The architecture is correct: browser.create_context(proxy_server=...) is
-nodriver's documented, official API for per-context proxy isolation. It passes
-proxy_server via CDP target.create_browser_context(), which Chrome handles
-natively per context — each context gets its own cookie jar, network stack, and
-proxy routing. This is not a Playwright API blend; it is in nodriver's own
-quickstart and browser class docs.
+zendriver is the community-maintained fork created to compile unmerged bugfixes.
+Its core API mirrors nodriver exactly, but its Browser class does not expose
+create_context() as a Python method. Per-request proxy isolation is achieved by
+calling the underlying CDP commands directly:
+  - Target.createBrowserContext(proxyServer=...) — creates an isolated context
+  - Target.createTarget(browserContextId=...) — opens a tab in that context
+  - Target.disposeBrowserContext(...) — cleans up after the fetch
 
-However, nodriver's ProxyForwarder class (which handles authenticated HTTP
-proxies) contains an unfixed NameError: inside util.py, ProxyForwarder.__init__
-calls util.free_port() when it should call free_port() — the class was moved
-into util.py during a refactor but the self-referential module prefix was never
-removed. The upstream maintainer acknowledged the bug but never merged the fix,
-and nodriver's PR queue has been frozen for months.
+PROXY HANDLING (per-request isolation)
+---------------------------------------
+Chrome cannot use embedded credentials in --proxy-server for HTTP proxies.
+_AsyncProxyForwarder solves this: it starts a local asyncio TCP server on a
+random localhost port that speaks the HTTP CONNECT protocol, then forwards
+tunnels to the upstream DataImpulse proxy, injecting Proxy-Authorization.
 
-zendriver is the community-maintained fork created specifically to compile these
-unmerged bugfixes. Its API is identical to nodriver (same create_context,
-Browser.create, Tab.get, cdp module paths). Switching is a one-line import
-change. The ProxyForwarder NameError is fixed in zendriver.
+Per request:
+  1. _AsyncProxyForwarder starts on 127.0.0.1:RANDOM_PORT
+  2. CDP Target.createBrowserContext(proxyServer="http://127.0.0.1:RANDOM_PORT")
+  3. Chrome connects to the forwarder; forwarder injects auth to DataImpulse
+  4. After fetch: dispose browser context + stop forwarder
 
-Install: pip install zendriver
-
-ARCHITECTURE
-------------
-- One shared Chrome process, launched at startup via zendriver.
-- asyncio.Semaphore(MAX_CONCURRENT_FETCHES) limits concurrency.
-- Per-request: new browser context (with isolated proxy) → navigate → extract
-  → close context. No cross-request cookie or state leakage.
-- Java orchestrates: sends URL, proxy URL, locale, timezone, referrer hint, and
-  navigation timing. The sidecar is responsible only for browser context
-  creation, navigation, dwell, and HTML extraction.
-
-PROXY HANDLING
---------------
-browser.create_context(proxy_server=...) is the correct API for per-context
-proxy isolation. For authenticated HTTP proxies (DataImpulse format), zendriver's
-ProxyForwarder starts a local forwarder that Chrome can reach without embedding
-credentials in --proxy-server (which Chrome ignores for HTTP proxies with auth).
-Each create_context() call with a distinct proxy URL gets its own isolated
-forwarding connection and cookie jar.
+This gives every fetch attempt its own exit IP and cookie jar, matching the
+proxy isolation behaviour of the other fetcher transports.
 
 PROCESS CLEANUP
 ---------------
@@ -86,6 +70,7 @@ ENDPOINTS
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import random
@@ -326,58 +311,98 @@ async def _execute_fetch(
     req:     NoDriverFetchRequest,
 ) -> NoDriverFetchResponse:
     """
-    Creates a per-request isolated browser context, navigates to the target
-    URL, applies dwell or selector wait, extracts HTML, and closes the context.
+    Creates a per-request isolated CDP browser context with its own proxy,
+    navigates to the target URL, applies dwell or selector wait, extracts
+    HTML, and disposes the context.
 
-    Each context has its own cookie jar and proxy configuration. No state
-    leaks between fetch attempts.
+    PROXY ISOLATION:
+    _AsyncProxyForwarder starts a local CONNECT tunnel for the request's
+    DataImpulse sticky-session URL, injecting Proxy-Authorization so Chrome
+    can reach the upstream without embedded credentials in --proxy-server.
+    Target.createBrowserContext binds Chrome's context to the local forwarder,
+    giving each attempt its own exit IP and isolated cookie jar.
 
-    PROXY NOTE: create_context() with proxy_server starts nodriver's internal
-    ProxyForwarder for authenticated HTTP proxies. Chrome's --proxy-server arg
-    does not support embedded credentials; the forwarder intercepts the CONNECT
-    tunnel and injects auth. This is nodriver's documented mechanism and
-    requires no Chrome extension.
+    ZENDRIVER NOTE:
+    zendriver's Browser class does not expose create_context(). The equivalent
+    is achieved by sending Target.createBrowserContext and Target.createTarget
+    directly over the CDP connection, then locating the resulting tab via
+    browser.targets once it is autodiscovered.
     """
-    hint        = _resolve_referrer_hint(req.referrer_hint)
-    referrer    = _REFERRER_URL[hint]
-    nav_timeout = req.timeout_seconds * 1000  # nodriver accepts milliseconds
+    hint     = _resolve_referrer_hint(req.referrer_hint)
+    referrer = _REFERRER_URL[hint]
 
-    create_context_kwargs: dict = {
-        "new_window": False,
-    }
-    if req.proxy_url:
-        create_context_kwargs["proxy_server"] = req.proxy_url
+    forwarder:          _AsyncProxyForwarder | None = None
+    browser_context_id: str | None                  = None
+    tab:                nodriver.Tab | None          = None
 
-    tab = await browser.create_context(**create_context_kwargs)
     try:
-        # Set Accept-Language via CDP so it is transmitted on every request
-        # from this context without overriding Chrome's native header ordering.
-        await tab.send(
-            nodriver.cdp.network.set_extra_http_headers(
-                headers=nodriver.cdp.network.Headers(
-                    {"Accept-Language": req.accept_language}
-                )
+        # ── 1. Start local proxy forwarder ────────────────────────────────────
+        local_proxy_server: str | None = None
+        if req.proxy_url:
+            forwarder = _AsyncProxyForwarder(req.proxy_url)
+            await forwarder.start()
+            local_proxy_server = forwarder.proxy_server
+            log.debug("Local CONNECT forwarder started on %s → %s",
+                      local_proxy_server, req.proxy_url.split("@")[-1])
+
+        # ── 2. Create isolated CDP browser context with proxy ─────────────────
+        browser_context_id = await browser.connection.send(
+            nodriver.cdp.target.create_browser_context(
+                proxy_server=local_proxy_server,
             )
         )
 
-        # Navigate with referrer when the hint is not DIRECT. Passing the
-        # referrer here causes Chrome to set both the Referer header and
-        # Sec-Fetch-Site natively and correctly, without any manual injection.
-        navigate_kwargs: dict = {"timeout": nav_timeout}
+        # ── 3. Create a tab (target) inside this context ──────────────────────
+        target_id = await browser.connection.send(
+            nodriver.cdp.target.create_target(
+                url="about:blank",
+                browser_context_id=browser_context_id,
+                new_window=True,
+            )
+        )
+
+        # Allow zendriver's autodiscover loop to register the new target.
+        deadline = asyncio.get_event_loop().time() + 3.0
+        while asyncio.get_event_loop().time() < deadline:
+            for t in browser.targets:
+                if str(t.target_id) == str(target_id):
+                    tab = t
+                    break
+            if tab is not None:
+                break
+            await asyncio.sleep(0.05)
+
+        if tab is None:
+            raise RuntimeError(
+                f"Tab for target {target_id} not found in browser.targets "
+                f"within 3 s. Context: {browser_context_id}"
+            )
+
+        # ── 4. Set Accept-Language and Referer before navigating ─────────────
+        # zendriver's Tab.get() dropped the referrer parameter that upstream
+        # nodriver exposed. Referer is injected via CDP set_extra_http_headers
+        # instead. Note: this approach does not trigger Chrome's native
+        # Sec-Fetch-Site logic (which only fires when referrer flows through
+        # the navigation context), so Sec-Fetch-Site will be "none" regardless
+        # of the referrer hint. The Referer header itself is still transmitted.
+        extra_headers: dict[str, str] = {"Accept-Language": req.accept_language}
         if referrer:
-            navigate_kwargs["referrer"] = referrer
+            extra_headers["Referer"] = referrer
 
-        response = await tab.get(req.url, **navigate_kwargs)
+        await tab.send(
+            nodriver.cdp.network.set_extra_http_headers(
+                headers=nodriver.cdp.network.Headers(extra_headers)
+            )
+        )
 
-        # tab.get() returns the Tab itself (navigation is implicit in nodriver).
-        # The HTTP status is available on the navigation response event, but
-        # nodriver does not expose it directly from get(). Use the CDP response
-        # from the network event instead.
+        # ── 5. Navigate ───────────────────────────────────────────────────────
+        await tab.get(req.url)
+
         status_code = await _resolve_status_code(tab, req.url)
         final_url   = tab.url
-
         log.info("navigation complete  status=%d  url=%s", status_code, req.url)
 
+        # ── 6. Dwell / selector wait ──────────────────────────────────────────
         if req.wait_for_selector:
             try:
                 await asyncio.wait_for(
@@ -386,13 +411,13 @@ async def _execute_fetch(
                 )
             except (asyncio.TimeoutError, Exception):
                 log.debug(
-                    "wait_for_selector '%s' timed out for %s — proceeding with content",
-                    req.wait_for_selector,
-                    req.url,
+                    "wait_for_selector '%s' timed out for %s — proceeding",
+                    req.wait_for_selector, req.url,
                 )
         elif req.default_wait_millis > 0:
             await _dwell(tab, req.default_wait_millis)
 
+        # ── 7. Extract HTML ───────────────────────────────────────────────────
         content: str = await tab.get_content()
         if not content or not content.strip():
             log.error("get_content() returned empty DOM for %s", req.url)
@@ -405,13 +430,202 @@ async def _execute_fetch(
         )
 
     finally:
-        # close() disposes the browser context and its cookie jar. Raising an
-        # exception in this block must not suppress the original exception, so
-        # the failure is logged and swallowed.
+        # ── Cleanup: tab → context → forwarder ───────────────────────────────
+        # Each step is individually guarded so a failure in one does not
+        # prevent the others from running.
+        if tab is not None:
+            try:
+                await tab.close()
+            except Exception as exc:
+                log.warning("Error closing tab: %s", exc)
+
+        if browser_context_id is not None:
+            try:
+                await browser.connection.send(
+                    nodriver.cdp.target.dispose_browser_context(
+                        browser_context_id=browser_context_id,
+                    )
+                )
+            except Exception as exc:
+                log.warning("Error disposing browser context %s: %s",
+                            browser_context_id, exc)
+
+        if forwarder is not None:
+            try:
+                await forwarder.stop()
+            except Exception as exc:
+                log.warning("Error stopping proxy forwarder: %s", exc)
+
+
+class _AsyncProxyForwarder:
+    """
+    Minimal asyncio HTTP CONNECT tunnel for authenticated upstream proxies.
+
+    Chrome's --proxy-server and CDP Target.createBrowserContext(proxyServer=...)
+    both accept proxy URLs, but Chrome silently ignores embedded credentials
+    for HTTP proxies. This forwarder accepts unauthenticated CONNECT requests
+    from Chrome on a random localhost port and re-issues them to the upstream
+    DataImpulse proxy with a Proxy-Authorization header injected.
+
+    Lifecycle:
+      forwarder = _AsyncProxyForwarder(proxy_url)
+      await forwarder.start()
+      # use forwarder.proxy_server as the proxy URL for CDP context creation
+      await forwarder.stop()
+
+    One forwarder per fetch attempt; MAX_CONCURRENT_FETCHES=1 ensures no
+    concurrent forwarders share the same lifecycle.
+    """
+
+    _BUFFER_SIZE = 65536
+    _CONNECT_TIMEOUT = 10.0
+
+    def __init__(self, upstream_url: str) -> None:
+        parsed              = urlparse(upstream_url)
+        self._upstream_host = parsed.hostname or ""
+        self._upstream_port = parsed.port or 8080
+        self._auth_header: str | None = None
+        if parsed.username and parsed.password:
+            creds = f"{parsed.username}:{parsed.password}"
+            encoded = base64.b64encode(creds.encode()).decode()
+            self._auth_header = f"Basic {encoded}"
+        self._server: asyncio.Server | None = None
+        self._local_port: int = 0
+
+    async def start(self) -> None:
+        self._server = await asyncio.start_server(
+            self._handle_connection, "127.0.0.1", 0
+        )
+        self._local_port = self._server.sockets[0].getsockname()[1]
+
+    async def stop(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+            self._server = None
+
+    @property
+    def proxy_server(self) -> str:
+        return f"http://127.0.0.1:{self._local_port}"
+
+    async def _handle_connection(
+        self,
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+    ) -> None:
+        """
+        Handles one CONNECT tunnel from Chrome.
+
+        Reads the CONNECT request line, opens a TCP connection to the upstream
+        proxy, re-issues the CONNECT with Proxy-Authorization injected, waits
+        for the upstream 200 Connection established response, then pipes bytes
+        bidirectionally until either side closes.
+        """
         try:
-            await tab.close()
+            # Read Chrome's CONNECT request line and headers
+            request_line = await client_reader.readline()
+            if not request_line:
+                return
+
+            # Consume remaining request headers from Chrome (we don't forward them)
+            while True:
+                header_line = await client_reader.readline()
+                if header_line in (b"\r\n", b"\n", b""):
+                    break
+
+            # Parse: CONNECT host:port HTTP/1.1
+            parts = request_line.decode(errors="replace").split()
+            if len(parts) < 2 or parts[0].upper() != "CONNECT":
+                client_writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                await client_writer.drain()
+                return
+
+            host_port = parts[1]
+            if ":" in host_port:
+                target_host, target_port_str = host_port.rsplit(":", 1)
+                target_port = int(target_port_str)
+            else:
+                target_host = host_port
+                target_port = 443
+
+            # Connect to upstream proxy
+            try:
+                up_reader, up_writer = await asyncio.wait_for(
+                    asyncio.open_connection(self._upstream_host, self._upstream_port),
+                    timeout=self._CONNECT_TIMEOUT,
+                )
+            except (asyncio.TimeoutError, OSError) as exc:
+                log.warning("Upstream proxy connection failed: %s", exc)
+                client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                await client_writer.drain()
+                return
+
+            # Re-issue CONNECT to upstream with auth injected
+            connect_lines = [
+                f"CONNECT {host_port} HTTP/1.1\r\n",
+                f"Host: {host_port}\r\n",
+            ]
+            if self._auth_header:
+                connect_lines.append(f"Proxy-Authorization: {self._auth_header}\r\n")
+            connect_lines.append("\r\n")
+            up_writer.write("".join(connect_lines).encode())
+            await up_writer.drain()
+
+            # Read upstream's response to our CONNECT
+            upstream_response = await up_reader.readline()
+            # Consume the rest of upstream's response headers
+            while True:
+                line = await up_reader.readline()
+                if line in (b"\r\n", b"\n", b""):
+                    break
+
+            if b"200" not in upstream_response:
+                log.warning("Upstream proxy rejected CONNECT: %s",
+                            upstream_response.decode(errors="replace").strip())
+                client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                await client_writer.drain()
+                up_writer.close()
+                return
+
+            # Tell Chrome the tunnel is established
+            client_writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            await client_writer.drain()
+
+            # Pipe bytes bidirectionally until either side closes
+            await asyncio.gather(
+                self._pipe(client_reader, up_writer),
+                self._pipe(up_reader, client_writer),
+                return_exceptions=True,
+            )
+
         except Exception as exc:
-            log.warning("Error closing tab/context after fetch: %s", exc)
+            log.debug("CONNECT handler error: %s", exc)
+        finally:
+            try:
+                client_writer.close()
+            except Exception:
+                pass
+
+    async def _pipe(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """Copies bytes from reader to writer until EOF or error."""
+        try:
+            while True:
+                data = await reader.read(self._BUFFER_SIZE)
+                if not data:
+                    break
+                writer.write(data)
+                await writer.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
 
 
 async def _resolve_status_code(tab: nodriver.Tab, url: str) -> int:
