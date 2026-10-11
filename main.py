@@ -38,6 +38,13 @@ from the UA with an override that carries no UA metadata, and real Chrome never
 looks like that. Headed Chrome reports its own complete, consistent identity,
 with nothing overridden. NODRIVER_HEADLESS=1 still works for quick local runs.
 
+Checked on the VPS itself (2026-10-11; Chrome 154 under xwfb-run, no GPU, 2
+cores): full Client Hints, a 1920x1080 screen, and 27 of 42 single-attempt
+fetches of the hard sources passed (Sky News 5 of 6) — in line with the laptop.
+WebGL is unavailable there; enabling SwiftShader (NODRIVER_EXTRA_ARGS=
+--enable-unsafe-swiftshader) made no difference (14/21 vs 13/21), so Chrome's
+default stands. NODRIVER_EXTRA_ARGS takes any extra Chrome flags, space-separated.
+
 PER FETCH
 ---------
 1. Timezone from the exit IP: one lookup at ip-api.com through the same proxy
@@ -210,6 +217,8 @@ def _browser_config() -> nodriver.Config:
     ]
     if not headless:
         browser_args += ["--window-size=1920,1080", "--window-position=0,0"]
+    # Extra Chrome flags for one deployment, space-separated (the systemd unit sets them).
+    browser_args += os.environ.get("NODRIVER_EXTRA_ARGS", "").split()
 
     # --no-sandbox is required when running as root (uid 0). The service file
     # specifies a non-root user; this guard is for container environments.

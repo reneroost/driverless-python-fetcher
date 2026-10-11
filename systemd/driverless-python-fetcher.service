@@ -6,8 +6,12 @@
 #
 # Headed Chrome on a virtual display (main.py, HEADED, NOT HEADLESS). AlmaLinux 10 has no Xvfb —
 # RHEL 10 dropped the X.Org server — so the display is Xwayland on a headless weston, via
-# xwfb-run from the xwayland-run package (dnf install xwayland-run weston). The compositor's
-# output is sized to Chrome's 1920x1080 window, so the window never exceeds the screen.
+# xwfb-run from the xwayland-run package (dnf install xwayland-run weston). Both the compositor's
+# output and Xwayland's screen are sized to Chrome's 1920x1080 window: without -geometry the X
+# screen stays 640x480, smaller than the window, which no real desktop shows. xwfb-run 0.0.4 hands
+# each --compositor-args / --server-args value to its program as ONE argument, so every option
+# gets its own flag; "--width=1920 --height=1080" in one value made weston fail to start and
+# xwfb-run wait for it forever. It creates its own XDG_RUNTIME_DIR when the unit has none.
 #
 # Limits are sized from measurements on 2026-10-11 (main.py, and FALLBACK.md in news-scraper):
 #   - TasksMax: Chrome and the display ran ~176 threads, peaking at 235 across all runs.
@@ -37,7 +41,7 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=driverless-python-fetcher
 
-ExecStart=/usr/bin/xwfb-run -c weston -z "--width=1920 --height=1080" -- /srv/mostreadnews/driverless-python-fetcher/.venv/bin/python3 main.py
+ExecStart=/usr/bin/xwfb-run -c weston --compositor-args=--width=1920 --compositor-args=--height=1080 --server-args=-geometry --server-args=1920x1080 -- /srv/mostreadnews/driverless-python-fetcher/.venv/bin/python3 main.py
 
 Restart=always
 RestartSec=10
