@@ -7,5 +7,7 @@ uvicorn>=0.34.0,<0.35.0
 # Strict DTO serialization & validation
 pydantic>=2.10.0,<3.0.0
 
-# CDP-native undetected browser client
-zendriver>=0.15.3,<0.16.0
+# CDP-native browser client. Pinned exactly: main.py drives CDP directly and relies on
+# zendriver internals checked against this release (create_context, handler domain
+# re-enabling, the headless UA patch it applies when not run headed).
+zendriver==0.17.1

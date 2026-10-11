@@ -1,0 +1,52 @@
+# Installed at /etc/systemd/system/driverless-python-fetcher.service on the prod host, DISABLED
+# until news-scraper switches routes to it (its FALLBACK.md is the runbook). Install or update:
+#
+#   scp systemd/driverless-python-fetcher.service hetzner-news:driverless-python-fetcher.service
+#   ssh -t hetzner-news 'sudo install -m 0644 ~/driverless-python-fetcher.service /etc/systemd/system/ && sudo systemctl daemon-reload && rm ~/driverless-python-fetcher.service'
+#
+# Headed Chrome on a virtual display (main.py, HEADED, NOT HEADLESS). AlmaLinux 10 has no Xvfb —
+# RHEL 10 dropped the X.Org server — so the display is Xwayland on a headless weston, via
+# xwfb-run from the xwayland-run package (dnf install xwayland-run weston). The compositor's
+# output is sized to Chrome's 1920x1080 window, so the window never exceeds the screen.
+#
+# Limits are sized from measurements on 2026-10-11 (main.py, and FALLBACK.md in news-scraper):
+#   - TasksMax: Chrome and the display ran ~176 threads, peaking at 235 across all runs.
+#   - Memory: ~0.66 GB median, 0.76 GB peak for the whole tree (0.87 GB before images were
+#     blocked), with Chrome recycled every 50 fetches. MemoryMax is the hard ceiling, at which the
+#     cgroup kills Chrome and the next fetch relaunches it.
+
+[Unit]
+Description=Driverless Python Fetcher (zendriver, headed Chrome)
+After=network.target
+
+[Service]
+Type=exec
+User=renx
+Group=renx
+WorkingDirectory=/srv/mostreadnews/driverless-python-fetcher
+
+# Prevent privilege escalation & isolate filesystem namespaces
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+MemoryHigh=1200M
+MemoryMax=1500M
+TasksMax=512
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=driverless-python-fetcher
+
+ExecStart=/usr/bin/xwfb-run -c weston -z "--width=1920 --height=1080" -- /srv/mostreadnews/driverless-python-fetcher/.venv/bin/python3 main.py
+
+Restart=always
+RestartSec=10
+
+Environment=PYTHONUNBUFFERED=1
+Environment=NODRIVER_CHROME_EXECUTABLE=/usr/bin/google-chrome
+Environment=NODRIVER_HEADLESS=0
+Environment=NODRIVER_HOST=127.0.0.1
+Environment=NODRIVER_PORT=8084
+
+[Install]
+WantedBy=multi-user.target
