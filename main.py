@@ -20,7 +20,7 @@ against 43/43 and 49/49 for curl_cffi on the same pages. The miss is wsj.com
 (DataDome). It also passed Sky News's Akamai on 7 of 10 single attempts, which
 neither curl_cffi nor camoufox has. Costs: median 7 s a fetch against 2.5 s,
 ~0.9-1.0 MB of proxy traffic against ~77 KB, ~0.66 GB of memory (0.76 GB
-peak). news-scraper's FALLBACK.md is the runbook for switching to it.
+peak). news-scraper's FETCHERS.md is the runbook for switching to it.
 
 VERSIONS
 --------

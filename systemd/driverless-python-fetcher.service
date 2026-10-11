@@ -1,5 +1,5 @@
 # Installed at /etc/systemd/system/driverless-python-fetcher.service on the prod host, DISABLED
-# until news-scraper switches routes to it (its FALLBACK.md is the runbook). Install or update:
+# until news-scraper switches routes to it (its FETCHERS.md is the runbook). Install or update:
 #
 #   scp systemd/driverless-python-fetcher.service hetzner-news:driverless-python-fetcher.service
 #   ssh -t hetzner-news 'sudo install -m 0644 ~/driverless-python-fetcher.service /etc/systemd/system/ && sudo systemctl daemon-reload && rm ~/driverless-python-fetcher.service'
@@ -13,7 +13,7 @@
 # gets its own flag; "--width=1920 --height=1080" in one value made weston fail to start and
 # xwfb-run wait for it forever. It creates its own XDG_RUNTIME_DIR when the unit has none.
 #
-# Limits are sized from measurements on 2026-10-11 (main.py, and FALLBACK.md in news-scraper):
+# Limits are sized from measurements on 2026-10-11 (main.py, and FETCHERS.md in news-scraper):
 #   - TasksMax: Chrome and the display ran ~176 threads, peaking at 235 across all runs.
 #   - Memory: ~0.66 GB median, 0.76 GB peak for the whole tree (0.87 GB before images were
 #     blocked), with Chrome recycled every 50 fetches. MemoryMax is the hard ceiling, at which the
